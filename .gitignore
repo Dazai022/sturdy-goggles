@@ -1,0 +1,15 @@
+.venv/
+.env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+reposentinel.db
+*.log
+*.db
+*-scan-report.json
+*-report.json
+latest-scan-report.json
+
+
+# Generated package metadata
+*.egg-info/
