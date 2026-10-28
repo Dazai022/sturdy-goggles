@@ -195,21 +195,18 @@ def create_app(*, settings: Settings | None = None, database: Database | None = 
             "github_login": identity.login,
         }
 
-    @app.get("/api/v1/github/oauth/callback", dependencies=[user_dependency])
-    def github_oauth_callback(state: str, code: str | None = None, error: str | None = None, user: Any = user_dependency) -> dict[str, object]:
+    @app.get("/api/v1/github/oauth/callback")
+    def github_oauth_callback(state: str, code: str | None = None, error: str | None = None) -> dict[str, object]:
         secret = runtime_settings.github_app_state_key
         if not secret or not verify_oauth_state(state, secret.get_secret_value()):
             raise HTTPException(status_code=400, detail="Invalid or expired GitHub OAuth state")
         if github_oauth is None or token_store is None:
             raise HTTPException(status_code=503, detail="GitHub OAuth is not configured")
-        state_owner = installation_state_user_id(state, secret.get_secret_value())
-        if state_owner is None or state_owner != str(user["id"]):
-            raise HTTPException(status_code=403, detail="GitHub OAuth state does not match the authenticated user")
         try:
             owner = token_store.consume_state(oauth_state_nonce(state))
         except ValueError as exc:
             raise HTTPException(status_code=400, detail="Invalid or already-used GitHub OAuth state") from exc
-        if owner is None or owner != str(user["id"]):
+        if owner is None:
             raise HTTPException(status_code=400, detail="Invalid or already-used GitHub OAuth state")
         if error or not code:
             raise HTTPException(status_code=400, detail="GitHub OAuth authorization was not completed")

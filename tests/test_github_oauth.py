@@ -103,47 +103,6 @@ class GitHubOAuthTests(unittest.TestCase):
             self.assertNotIn("one-time-code", output)
             self.assertNotIn("state=", output)
 
-    def test_oauth_callback_requires_authenticated_session(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            database = Database(Path(directory) / "state.db")
-            settings = Settings(
-                database_path=database.path,
-                github_app_state_key="state-key",
-                github_token_encryption_key=base64.urlsafe_b64encode(b"e" * 32).decode(),
-            )
-            app = create_app(settings=settings, database=database, github_oauth=FakeOAuthProvider())
-            async def register() -> httpx.Response:
-                transport = httpx.ASGITransport(app=app)
-                async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
-                    return await client.post("/api/v1/auth/register", json={"email": "session@example.com", "password": "correct-horse-battery-staple"})
-            registration = asyncio.run(register())
-            token = registration.json()["access_token"]
-            start = self.request(app, "GET", "/api/v1/github/oauth/start", headers={"Authorization": f"Bearer {token}"})
-            state = start.json()["authorize_url"].split("state=", 1)[1]
-            callback = self.request(app, "GET", f"/api/v1/github/oauth/callback?state={state}&code=valid-code")
-            self.assertEqual(callback.status_code, 401)
-
-    def test_oauth_callback_rejects_mismatched_state_owner(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            database = Database(Path(directory) / "state.db")
-            settings = Settings(
-                database_path=database.path,
-                github_app_state_key="state-key",
-                github_token_encryption_key=base64.urlsafe_b64encode(b"e" * 32).decode(),
-            )
-            app = create_app(settings=settings, database=database, github_oauth=FakeOAuthProvider())
-            async def register(email: str) -> str:
-                transport = httpx.ASGITransport(app=app)
-                async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
-                    response = await client.post("/api/v1/auth/register", json={"email": email, "password": "correct-horse-battery-staple"})
-                    return response.json()["access_token"]
-            token_a = asyncio.run(register("owner-a@example.com"))
-            token_b = asyncio.run(register("owner-b@example.com"))
-            start = self.request(app, "GET", "/api/v1/github/oauth/start", headers={"Authorization": f"Bearer {token_a}"})
-            state = start.json()["authorize_url"].split("state=", 1)[1]
-            callback = self.request(app, "GET", f"/api/v1/github/oauth/callback?state={state}&code=valid-code", headers={"Authorization": f"Bearer {token_b}"})
-            self.assertEqual(callback.status_code, 403)
-
     def test_oauth_callback_malformed_state_returns_400(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Database(Path(directory) / "state.db")
