@@ -13,3 +13,7 @@ latest-scan-report.json
 
 # Generated package metadata
 *.egg-info/
+frontend/node_modules/
+frontend/.next/
+frontend/.env.local
+frontend/tsconfig.tsbuildinfo

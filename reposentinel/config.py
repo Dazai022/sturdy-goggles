@@ -1,7 +1,7 @@
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -17,6 +17,24 @@ class Settings(BaseSettings):
     )
 
     database_path: Path = Path("reposentinel.db")
+    api_token: SecretStr | None = None
+    github_app_slug: str | None = None
+    github_app_id: int | None = None
+    github_app_private_key: SecretStr | None = None
+    github_app_private_key_path: Path | None = None
+    github_app_client_id: str | None = None
+    github_app_client_credential: SecretStr | None = None
+    github_app_oauth_redirect_uri: str | None = None
+    github_app_redirect_uri: str | None = None
+    github_oauth_client_id: str | None = None
+    github_oauth_client_credential: SecretStr | None = None
+    github_oauth_redirect_uri: str | None = None
+    github_oauth_url: str = "https://github.com"
+    github_token_encryption_key: SecretStr | None = None
+    github_app_state_key: SecretStr | None = None
+    github_app_token_skew_seconds: int = 60
+    github_app_max_retries: int = 2
+    github_app_retry_backoff_seconds: float = 0.5
     github_token: SecretStr | None = None
     allowed_repositories: list[str] = Field(default_factory=list)
     github_api_url: str = "https://api.github.com"
@@ -62,6 +80,36 @@ class Settings(BaseSettings):
     @classmethod
     def validate_ollama_endpoint(cls, value: str) -> str:
         return value.rstrip("/")
+
+    @field_validator("github_app_id")
+    @classmethod
+    def validate_app_id(cls, value: int | None) -> int | None:
+        if value is not None and value <= 0:
+            raise ValueError("github_app_id must be positive")
+        return value
+
+    @field_validator("github_app_token_skew_seconds")
+    @classmethod
+    def validate_token_skew(cls, value: int) -> int:
+        if not 1 <= value <= 600:
+            raise ValueError("github_app_token_skew_seconds must be between 1 and 600")
+        return value
+
+    @field_validator("github_app_max_retries")
+    @classmethod
+    def validate_app_retries(cls, value: int) -> int:
+        if not 0 <= value <= 5:
+            raise ValueError("github_app_max_retries must be between 0 and 5")
+        return value
+
+    @model_validator(mode="after")
+    def validate_github_app_user_auth(self) -> "Settings":
+        if self.github_app_client_id or self.github_app_client_credential:
+            if not self.github_app_client_id or not self.github_app_client_credential:
+                raise ValueError("GitHub App client ID and client credential must be configured together")
+            if not self.github_app_oauth_redirect_uri:
+                raise ValueError("github_app_oauth_redirect_uri is required for GitHub App user authorization")
+        return self
 
 
 @lru_cache(maxsize=1)

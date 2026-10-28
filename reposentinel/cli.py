@@ -268,5 +268,19 @@ def analyze(
     console.print_json(data=assessment.model_dump(mode="json"))
 
 
+@app.command()
+def serve(
+    host: str = typer.Option("127.0.0.1", help="Bind address; keep loopback for local use."),
+    port: int = typer.Option(8000, min=1, max=65535, help="HTTP port."),
+) -> None:
+    """Serve the authenticated, read-only scan API for local dashboard development."""
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        console.print("[red]Refusing non-loopback bind; production user/session authorization is not implemented.[/red]")
+        raise typer.Exit(code=2)
+    import uvicorn
+
+    uvicorn.run("reposentinel.auth_api:get_app", host=host, port=port, factory=True)
+
+
 if __name__ == "__main__":
     app()

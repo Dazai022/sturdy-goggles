@@ -8,7 +8,7 @@ from typing import Iterator
 from uuid import uuid4
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 class ScanAlreadyRunning(ValueError):
@@ -238,6 +238,66 @@ class Database:
                     UPDATE schema_version SET version = 8;
                     """
                 )
+            if current < 9:
+                connection.executescript(
+                    """
+                    CREATE TABLE users (
+                        id TEXT PRIMARY KEY,
+                        email TEXT NOT NULL UNIQUE,
+                        password_hash TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        disabled_at TEXT
+                    );
+                    CREATE TABLE sessions (
+                        id TEXT PRIMARY KEY,
+                        user_id TEXT NOT NULL REFERENCES users(id),
+                        token_hash TEXT NOT NULL UNIQUE,
+                        created_at TEXT NOT NULL,
+                        expires_at TEXT NOT NULL,
+                        revoked_at TEXT
+                    );
+                    CREATE INDEX sessions_token_idx ON sessions(token_hash);
+                    CREATE TABLE github_installations (
+                        id TEXT PRIMARY KEY,
+                        github_installation_id INTEGER NOT NULL UNIQUE,
+                        account_login TEXT NOT NULL,
+                        account_type TEXT NOT NULL,
+                        permissions_json TEXT NOT NULL DEFAULT '{}',
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+                    CREATE TABLE user_installations (
+                        user_id TEXT NOT NULL REFERENCES users(id),
+                        installation_id TEXT NOT NULL REFERENCES github_installations(id),
+                        created_at TEXT NOT NULL,
+                        PRIMARY KEY (user_id, installation_id)
+                    );
+                    CREATE TABLE user_repositories (
+                        user_id TEXT NOT NULL REFERENCES users(id),
+                        installation_id TEXT NOT NULL REFERENCES github_installations(id),
+                        github_repo_id INTEGER NOT NULL,
+                        full_name TEXT NOT NULL,
+                        default_branch TEXT,
+                        description TEXT,
+                        private INTEGER NOT NULL DEFAULT 0 CHECK (private IN (0, 1)),
+                        selected INTEGER NOT NULL DEFAULT 0 CHECK (selected IN (0, 1)),
+                        accessible INTEGER NOT NULL DEFAULT 1 CHECK (accessible IN (0, 1)),
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY (user_id, github_repo_id)
+                    );
+                    CREATE INDEX user_repositories_user_idx ON user_repositories(user_id, selected, full_name);
+                    UPDATE schema_version SET version = 9;
+                    """
+                )
+            current = max(current, 9)
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS github_installation_states (
+                    nonce TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL REFERENCES users(id),
+                    expires_at TEXT NOT NULL,
+                    consumed_at TEXT
+                )"""
+            )
 
     def upsert_repository(self, full_name: str, *, default_branch: str | None = None,
                           description: str | None = None, metadata_json: str = "{}") -> str:
@@ -267,6 +327,132 @@ class Database:
     def list_repositories(self) -> list[sqlite3.Row]:
         with self.connection() as connection:
             return list(connection.execute("SELECT * FROM repositories ORDER BY full_name"))
+
+    def create_user(self, email: str, password_hash: str) -> str:
+        user_id = str(uuid4())
+        with self.connection() as connection:
+            connection.execute(
+                "INSERT INTO users(id, email, password_hash, created_at) VALUES (?, ?, ?, ?)",
+                (user_id, email.strip().lower(), password_hash, datetime.now(timezone.utc).isoformat()),
+            )
+        return user_id
+
+    def user_by_email(self, email: str) -> sqlite3.Row | None:
+        with self.connection() as connection:
+            return connection.execute(
+                "SELECT * FROM users WHERE email = ? AND disabled_at IS NULL",
+                (email.strip().lower(),),
+            ).fetchone()
+
+    def user_by_id(self, user_id: str) -> sqlite3.Row | None:
+        with self.connection() as connection:
+            return connection.execute(
+                "SELECT * FROM users WHERE id = ? AND disabled_at IS NULL", (user_id,)
+            ).fetchone()
+
+    def create_session(self, user_id: str, token_hash: str, expires_at: str) -> str:
+        session_id = str(uuid4())
+        with self.connection() as connection:
+            connection.execute(
+                "INSERT INTO sessions(id, user_id, token_hash, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
+                (session_id, user_id, token_hash, datetime.now(timezone.utc).isoformat(), expires_at),
+            )
+        return session_id
+
+    def user_by_session_hash(self, token_hash: str) -> sqlite3.Row | None:
+        with self.connection() as connection:
+            return connection.execute(
+                """SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id
+                   WHERE s.token_hash = ? AND s.revoked_at IS NULL AND s.expires_at > ? AND u.disabled_at IS NULL""",
+                (token_hash, datetime.now(timezone.utc).isoformat()),
+            ).fetchone()
+
+    def revoke_session(self, token_hash: str) -> None:
+        with self.connection() as connection:
+            connection.execute(
+                "UPDATE sessions SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL",
+                (datetime.now(timezone.utc).isoformat(), token_hash),
+            )
+
+    def upsert_github_installation(self, github_installation_id: int, account_login: str,
+                                   account_type: str, permissions_json: str = "{}") -> str:
+        now = datetime.now(timezone.utc).isoformat()
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT id FROM github_installations WHERE github_installation_id = ?",
+                (github_installation_id,),
+            ).fetchone()
+            installation_id = str(row[0]) if row else str(uuid4())
+            connection.execute(
+                """INSERT INTO github_installations(id, github_installation_id, account_login, account_type,
+                   permissions_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(github_installation_id) DO UPDATE SET account_login=excluded.account_login,
+                   account_type=excluded.account_type, permissions_json=excluded.permissions_json,
+                   updated_at=excluded.updated_at""",
+                (installation_id, github_installation_id, account_login, account_type, permissions_json, now, now),
+            )
+            return installation_id
+
+    def link_user_installation(self, user_id: str, installation_id: str) -> None:
+        with self.connection() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO user_installations(user_id, installation_id, created_at) VALUES (?, ?, ?)",
+                (user_id, installation_id, datetime.now(timezone.utc).isoformat()),
+            )
+
+    def store_installation_state(self, nonce: str, user_id: str, expires_at: str) -> None:
+        with self.connection() as connection:
+            connection.execute(
+                "INSERT INTO github_installation_states(nonce, user_id, expires_at) VALUES (?, ?, ?)",
+                (nonce, user_id, expires_at),
+            )
+
+    def consume_installation_state(self, nonce: str, user_id: str) -> bool:
+        with self.connection() as connection:
+            updated = connection.execute(
+                "UPDATE github_installation_states SET consumed_at = ? WHERE nonce = ? AND user_id = ? AND consumed_at IS NULL AND expires_at > ?",
+                (datetime.now(timezone.utc).isoformat(), nonce, user_id, datetime.now(timezone.utc).isoformat()),
+            ).rowcount
+            return updated == 1
+
+    def upsert_user_repository(self, user_id: str, installation_id: str, github_repo_id: int, full_name: str,
+                               *, default_branch: str | None, description: str | None, private: bool) -> None:
+        with self.connection() as connection:
+            connection.execute(
+                """INSERT INTO user_repositories(user_id, installation_id, github_repo_id, full_name,
+                   default_branch, description, private, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(user_id, github_repo_id) DO UPDATE SET installation_id=excluded.installation_id,
+                   full_name=excluded.full_name, default_branch=excluded.default_branch,
+                   description=excluded.description, private=excluded.private, accessible=1,
+                   updated_at=excluded.updated_at""",
+                (user_id, installation_id, github_repo_id, full_name.strip().lower(), default_branch,
+                 description, int(private), datetime.now(timezone.utc).isoformat()),
+            )
+
+    def user_repositories(self, user_id: str) -> list[sqlite3.Row]:
+        with self.connection() as connection:
+            return list(connection.execute(
+                "SELECT * FROM user_repositories WHERE user_id = ? AND accessible = 1 ORDER BY full_name",
+                (user_id,),
+            ))
+
+    def set_user_repository_selection(self, user_id: str, github_repo_id: int, selected: bool) -> None:
+        with self.connection() as connection:
+            updated = connection.execute(
+                "UPDATE user_repositories SET selected = ?, updated_at = ? WHERE user_id = ? AND github_repo_id = ? AND accessible = 1",
+                (int(selected), datetime.now(timezone.utc).isoformat(), user_id, github_repo_id),
+            ).rowcount
+            if updated != 1:
+                raise KeyError("Repository is not accessible to this user")
+
+    def user_scan_history(self, user_id: str, limit: int = 20) -> list[sqlite3.Row]:
+        with self.connection() as connection:
+            return list(connection.execute(
+                """SELECT DISTINCT s.*, r.full_name FROM scan_runs s JOIN repositories r ON r.id = s.repository_id
+                   JOIN user_repositories ur ON ur.full_name = r.full_name
+                   WHERE ur.user_id = ? AND ur.accessible = 1 ORDER BY s.started_at DESC LIMIT ?""",
+                (user_id, limit),
+            ))
 
     def start_scan(self, repository_id: str, commit_sha: str = "") -> str:
         scan_id = str(uuid4())
